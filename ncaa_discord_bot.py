@@ -133,10 +133,33 @@ class TeamDropdown(discord.ui.Select):
                 await interaction.response.send_message("Could not find your server membership. Please use this in the server.", ephemeral=True)
                 return
 
+
+
+        # Always get bot_logs_channel before any try/except
+        bot_logs_channel = discord.utils.get(guild.text_channels, name=BOT_LOGS_CHANNEL)
+
         role = discord.utils.get(guild.roles, name=team_name)
         if not role:
-            role = await guild.create_role(name=team_name)
-        await member.add_roles(role)
+            try:
+                role = await guild.create_role(name=team_name)
+            except Exception as e:
+                error_msg = f"Failed to create role '{team_name}' for user {member} (ID: {member.id}): {e}"
+                if bot_logs_channel:
+                    await bot_logs_channel.send(error_msg)
+                await create_ticket(guild, member, error_msg)
+                await interaction.response.send_message(
+                    f"Sorry, I couldn't create the role for '{team_name}'. A support ticket has been opened.", ephemeral=True)
+                return
+        try:
+            await member.add_roles(role)
+        except Exception as e:
+            error_msg = f"Failed to add role '{team_name}' to user {member} (ID: {member.id}): {e}"
+            if bot_logs_channel:
+                await bot_logs_channel.send(error_msg)
+            await create_ticket(guild, member, error_msg)
+            await interaction.response.send_message(
+                f"Sorry, I couldn't assign the role '{team_name}' to you. A support ticket has been opened.", ephemeral=True)
+            return
 
         bot_logs_channel = discord.utils.get(guild.text_channels, name=BOT_LOGS_CHANNEL)
         class NicknameModal(discord.ui.Modal, title="Set Your Nickname"):
@@ -191,6 +214,8 @@ class TeamDropdown(discord.ui.Select):
                 if error_message:
                     if bot_logs_channel:
                         await bot_logs_channel.send(f"{member.mention} {error_message}")
+                    await create_ticket(guild, member, error_message)
+                    await modal_interaction.followup.send(f"There was an error setting your nickname. A support ticket has been opened.", ephemeral=True)
                 else:
                     if bot_logs_channel:
                         await bot_logs_channel.send(f"{member.mention} nickname set to: {new_nick}. Access granted to all league channels.")
@@ -223,6 +248,71 @@ async def post_team_selection(ctx):
             await ctx.send(f"Choose your {conference} conference team:", view=view)
 
 # Example handler for team selection (to be expanded with discord.ui)
+class ChangeNicknameView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(ChangeNicknameButton())
+
+class ChangeNicknameButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Change/Reset Nickname & Team", style=discord.ButtonStyle.primary)
+
+    async def callback(self, interaction: discord.Interaction):
+        import discord.errors
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception:
+            pass
+        member = interaction.user
+        guild = interaction.guild or None
+        if guild is None:
+            # Try to find the guild from mutual guilds
+            if hasattr(member, 'mutual_guilds'):
+                possible_guilds = member.mutual_guilds
+            else:
+                possible_guilds = [g for g in bot.guilds if g.get_member(member.id)]
+            if possible_guilds:
+                guild = possible_guilds[0]
+                member = guild.get_member(member.id)
+            else:
+                return
+        bot_logs_channel = discord.utils.get(guild.text_channels, name=BOT_LOGS_CHANNEL)
+        # Remove old team role if present
+        old_team_role = None
+        for role in member.roles:
+            if role.name in [team['ScrapedName'] for team in teams]:
+                old_team_role = role
+                break
+        if old_team_role:
+            await member.remove_roles(old_team_role)
+        # Send team selection dropdown to DM
+        try:
+            conference_teams = {}
+            for conference, teams_list in ncaa_data.items():
+                conference_teams[conference] = teams_list
+            max_options = 25
+            for conference, teams_list in conference_teams.items():
+                for i in range(0, len(teams_list), max_options):
+                    options = []
+                    for team in teams_list[i:i+max_options]:
+                        options.append(discord.SelectOption(label=team['ScrapedName'], description=team['ScrapedName'], value=team['ScrapedName']))
+                    view = discord.ui.View(timeout=None)
+                    view.add_item(TeamDropdown(options))
+                    await member.send(f"Choose your {conference} conference team:", view=view)
+            if bot_logs_channel:
+                await bot_logs_channel.send(f"Sent team selection dropdown to {member.mention}'s DM.")
+        except Exception as e:
+            if bot_logs_channel:
+                await bot_logs_channel.send(f"Failed to send team selection dropdown to {member.mention}'s DM: {e}")
+
+@bot.command()
+async def change_nickname(ctx):
+    """Post a button in #team-selection to let users change/reset their nickname and team."""
+    if ctx.channel.name != TEAM_SELECTION_CHANNEL:
+        await ctx.send(f"Please use this command in #{TEAM_SELECTION_CHANNEL}.")
+        return
+    view = ChangeNicknameView()
+    await ctx.send("Want to change your team or nickname? Click below!", view=view)
 async def assign_team_role(member, team_name):
     guild = member.guild
     role = discord.utils.get(guild.roles, name=team_name)
@@ -496,5 +586,37 @@ async def setup_permissions(ctx):
     if bot_logs_channel:
         await bot_logs_channel.send(f"Permissions set for channels: {', '.join(changed)}")
 
+# Admin command to close a ticket
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def close_ticket(ctx, member: discord.Member):
+    """Close a user's ticket channel. Usage: !close_ticket @user"""
+    ticket_channel_name = f"ticket-{member.id}"
+    ticket_channel = discord.utils.get(ctx.guild.text_channels, name=ticket_channel_name)
+    if not ticket_channel:
+        await ctx.send(f"No open ticket found for {member.mention}.")
+        return
+    await ticket_channel.delete()
+    await ctx.send(f"Ticket for {member.mention} has been closed.")
+
+# Helper: Create a ticket channel for a user and notify admins
+async def create_ticket(guild, user, error_message):
+    ticket_channel_name = f"ticket-{user.id}"
+    # Check if ticket already exists
+    existing = discord.utils.get(guild.text_channels, name=ticket_channel_name)
+    if existing:
+        await existing.send(f"Another error occurred: {error_message}")
+        return existing
+    # Create channel, only user and admins can see
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_messages=True)
+    }
+    admin_role = discord.utils.get(guild.roles, name=ADMIN_ROLE)
+    if admin_role:
+        overwrites[admin_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_messages=True)
+    ticket_channel = await guild.create_text_channel(ticket_channel_name, overwrites=overwrites, topic=f"Support ticket for {user.display_name}")
+    await ticket_channel.send(f"Hello {user.mention}, a ticket has been created for your error:\n> {error_message}\nAn admin will assist you here.")
+    return ticket_channel
 # To run the bot, uncomment and add your token:
 bot.run('')
